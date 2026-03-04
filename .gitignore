@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Linting
+.ruff_cache/
+
+# IDEs & Editors
+.vscode/
+.cursor/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Nix
+result
+result-*
+
+# PostgreSQL
+.pgdata/
+/tmp/cardstream-pg/
+
+# Logs
+*.log
+
+# Secrets — .env files are plaintext, never commit them.
+# secrets.yaml is SOPS-encrypted and safe to commit.
+# .sops.yaml contains only the public key and is safe to commit.
+.env
+.env.*
+!.env.example
+*.plain
+keys.txt
