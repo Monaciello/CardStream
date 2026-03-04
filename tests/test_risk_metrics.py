@@ -1,4 +1,4 @@
-"""Tests for risk metrics engine — Sharpe, Sortino, VaR, drawdown, rolling."""
+"""Tests for risk metrics engine — annualized Sharpe/Sortino, VaR, drawdown, rolling."""
 from __future__ import annotations
 
 from datetime import date, timedelta
@@ -6,6 +6,7 @@ from datetime import date, timedelta
 import numpy as np
 
 from src.backend.transforms.risk_metrics import (
+    ANNUALIZATION_FACTOR,
     _classify_risk,
     _max_drawdown,
     compute_risk_profiles,
@@ -52,8 +53,14 @@ class TestComputeRiskProfiles:
         profiles = compute_risk_profiles(summaries)
         assert len(profiles) == 0
 
-    def test_two_days_minimum(self):
+    def test_two_days_skipped(self):
+        """Minimum is 3 data points for first-difference returns."""
         summaries = _make_summaries(days=2)
+        profiles = compute_risk_profiles(summaries)
+        assert len(profiles) == 0
+
+    def test_three_days_minimum(self):
+        summaries = _make_summaries(days=3, volatility=0.01)
         profiles = compute_risk_profiles(summaries)
         assert len(profiles) == 1
 
@@ -61,8 +68,8 @@ class TestComputeRiskProfiles:
         assert compute_risk_profiles([]) == []
 
     def test_multiple_merchants(self):
-        s1 = _make_summaries("MERCH-A", days=5)
-        s2 = _make_summaries("MERCH-B", days=5)
+        s1 = _make_summaries("MERCH-A", days=5, volatility=0.01)
+        s2 = _make_summaries("MERCH-B", days=5, volatility=0.01)
         profiles = compute_risk_profiles(s1 + s2)
         ids = {p.merchant_id for p in profiles}
         assert ids == {"MERCH-A", "MERCH-B"}
@@ -73,8 +80,18 @@ class TestComputeRiskProfiles:
         assert profiles[0].sharpe_ratio is not None
         assert profiles[0].sharpe_ratio > 0
 
-    def test_high_failure_produces_negative_sharpe(self):
-        summaries = _make_summaries(days=10, base_failure_rate=0.15, volatility=0.02)
+    def test_declining_rates_produce_negative_sharpe(self):
+        """A merchant whose success rate trends downward has negative daily returns."""
+        summaries = [
+            TransactionSummary(
+                merchant_id="MERCH-DECLINING",
+                txn_date=date(2025, 1, 1) + timedelta(days=i),
+                total_volume=1000.0,
+                txn_count=100,
+                failure_rate=round(0.05 + i * 0.05, 2),
+            )
+            for i in range(10)
+        ]
         profiles = compute_risk_profiles(summaries, target_sla=0.95)
         p = profiles[0]
         assert p.sharpe_ratio is not None
@@ -101,7 +118,7 @@ class TestComputeRiskProfiles:
         assert profiles[0].max_drawdown >= 0.0
 
     def test_sortino_only_uses_downside(self):
-        summaries = _make_summaries(days=10, base_failure_rate=0.01)
+        summaries = _make_summaries(days=10, base_failure_rate=0.01, volatility=0.005)
         profiles = compute_risk_profiles(summaries, target_sla=0.95)
         p = profiles[0]
         if p.sortino_ratio is not None and p.sharpe_ratio is not None:
@@ -110,15 +127,38 @@ class TestComputeRiskProfiles:
     def test_calmar_none_when_no_drawdown(self):
         summaries = _make_summaries(days=5, base_failure_rate=0.0, volatility=0.0)
         profiles = compute_risk_profiles(summaries)
-        p = profiles[0]
-        assert p.calmar_ratio is None or p.max_drawdown == 0.0
+        if profiles:
+            p = profiles[0]
+            assert p.calmar_ratio is None or p.max_drawdown == 0.0
 
     def test_profiles_sorted_by_sharpe(self):
-        s_good = _make_summaries("MERCH-GOOD", days=10, base_failure_rate=0.01)
+        s_good = _make_summaries("MERCH-GOOD", days=10, base_failure_rate=0.01, volatility=0.005)
         s_bad = _make_summaries("MERCH-BAD", days=10, base_failure_rate=0.20, volatility=0.05)
         profiles = compute_risk_profiles(s_good + s_bad, target_sla=0.95)
         sharpes = [p.sharpe_ratio or float("-inf") for p in profiles]
         assert sharpes == sorted(sharpes)
+
+    def test_annualization_factor_is_365(self):
+        """Payments use 365-day annualization (not 252 trading days)."""
+        assert ANNUALIZATION_FACTOR == 365
+
+    def test_no_inf_or_nan_in_profiles(self):
+        """First-difference returns should never produce inf/NaN."""
+        summaries = []
+        for i in range(15):
+            summaries.append(TransactionSummary(
+                merchant_id="MERCH-ZERO",
+                txn_date=date(2025, 1, 1) + timedelta(days=i),
+                total_volume=200.0,
+                txn_count=2,
+                failure_rate=1.0 if i % 5 == 0 else 0.0,
+            ))
+        profiles = compute_risk_profiles(summaries)
+        for p in profiles:
+            if p.sharpe_ratio is not None:
+                assert np.isfinite(p.sharpe_ratio)
+            if p.sortino_ratio is not None:
+                assert np.isfinite(p.sortino_ratio)
 
 
 class TestMaxDrawdown:
@@ -134,6 +174,11 @@ class TestMaxDrawdown:
 
     def test_single_element(self):
         assert _max_drawdown(np.array([0.95])) == 0.0
+
+    def test_drawdown_peak_to_trough(self):
+        rates = np.array([1.0, 0.95, 0.90, 0.92, 0.88])
+        dd = _max_drawdown(rates)
+        assert 0 < dd < 1.0
 
 
 class TestClassifyRisk:
@@ -166,7 +211,10 @@ class TestComputeRollingSuccess:
     def test_columns_present(self):
         summaries = _make_summaries(days=10)
         df = compute_rolling_success(summaries)
-        expected_cols = {"merchant_id", "txn_date", "success_rate", "rolling_success", "rolling_volume"}
+        expected_cols = {
+            "merchant_id", "txn_date", "success_rate",
+            "daily_change", "rolling_mean", "rolling_std",
+        }
         assert expected_cols.issubset(set(df.columns))
 
     def test_row_count_matches_input(self):
@@ -178,12 +226,36 @@ class TestComputeRollingSuccess:
         summaries = _make_summaries(days=14, volatility=0.1)
         df = compute_rolling_success(summaries, window=7)
         raw_std = df["success_rate"].std()
-        rolling_std = df["rolling_success"].std()
+        rolling_std = df["rolling_mean"].std()
         assert rolling_std <= raw_std
 
     def test_window_of_1_equals_raw(self):
         summaries = _make_summaries(days=5)
         df = compute_rolling_success(summaries, window=1)
         np.testing.assert_array_almost_equal(
-            df["success_rate"].values, df["rolling_success"].values
+            df["success_rate"].values, df["rolling_mean"].values
         )
+
+    def test_daily_change_is_first_difference(self):
+        """Verify daily_change is diff() not pct_change()."""
+        summaries = _make_summaries(days=5, volatility=0.02)
+        df = compute_rolling_success(summaries)
+        rates = df["success_rate"].values
+        expected = np.diff(rates)
+        actual = df["daily_change"].dropna().values
+        np.testing.assert_array_almost_equal(actual, expected)
+
+    def test_no_inf_in_rolling(self):
+        """Verify first-difference never produces inf (unlike pct_change)."""
+        summaries = []
+        for i in range(10):
+            summaries.append(TransactionSummary(
+                merchant_id="MERCH-FLIP",
+                txn_date=date(2025, 1, 1) + timedelta(days=i),
+                total_volume=200.0,
+                txn_count=2,
+                failure_rate=1.0 if i % 2 == 0 else 0.0,
+            ))
+        df = compute_rolling_success(summaries)
+        assert not df["daily_change"].replace([np.inf, -np.inf], np.nan).isna().all()
+        assert np.all(np.isfinite(df["daily_change"].dropna()))

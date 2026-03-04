@@ -24,7 +24,7 @@ list[TransactionSummary]          ← one row per merchant per day
     ├──▶ compute_risk_profiles()      → MerchantRiskProfile   → risk analytics tab
     ├──▶ compute_rolling_success()    → DataFrame              → rolling charts
     ├──▶ render_charts()              → Plotly charts           → overview tab
-    └──▶ render_migration_tracker()   → styled table            → migration tab
+    └──▶ render_failure_analysis()    → failure breakdown       → failure analysis tab
 ```
 
 ## Inputs
@@ -32,16 +32,19 @@ list[TransactionSummary]          ← one row per merchant per day
 - Data source: `DataConnector` (PostgreSQL locally, Snowflake in prod)
 - Table: `raw_transactions` (local) / `PAYMENTS_DB.ANALYTICS.RAW_TRANSACTIONS`
 - Columns: transaction_id, merchant_id, amount, status, failure_reason, txn_date
-- User controls: lookback window, warning/critical thresholds, min volume, merchant filter
+- User controls: 
+  - Lookback window (7/14/30 days)
+  - Merchant filter (global, applies to all tabs)
+  - Warning/critical thresholds for alert coloring
+  - Min transaction count
 
 ## Outputs
 
 - Alert banner: OK / WARNING / CRITICAL with merchant names
 - Four KPI metrics: active merchants, total volume, avg failure rate, high-risk count
-- Transaction Overview tab: 4 Plotly charts (volume, failure rate, counts, top-10)
-- Risk Analytics tab: Sharpe/Sortino scatter, VaR distribution, heatmap,
-  rolling success rate, interactive risk table with CSV download
-- Migration Tracker tab: RAG-colored merchant summary table
+- Transaction Overview tab: 3 Plotly charts (volume trend, failure rate by merchant with threshold lines, top-10 merchants)
+- Risk Analytics tab: Sharpe/Sortino scatter, VaR distribution, heatmap, rolling success rate (mean/volatility/change distribution), interactive risk table with CSV download
+- Failure Analysis tab: Failure reason donut chart, failure by merchant stacked bar, failure trend line, filterable detail table with CSV download
 
 ## Validation Rules
 

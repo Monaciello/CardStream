@@ -17,7 +17,7 @@ from src.backend.transforms.alert_models import AlertConfig
 from src.backend.transforms.pipeline import run_pipeline
 from src.frontend.components.alert_banner import render_alert_banner
 from src.frontend.components.charts import render_charts
-from src.frontend.components.migration_tracker import render_migration_tracker
+from src.frontend.components.failure_analysis import render_failure_analysis
 from src.frontend.components.risk_dashboard import render_risk_dashboard
 
 
@@ -61,7 +61,8 @@ def main(connector: DataConnector | None = None) -> None:
 
     connector = connector or SiSConnector(get_session())
 
-    st.sidebar.title("Filters")
+    # ── Date range ────────────────────────────────────────────────
+    st.sidebar.header("Date Range")
 
     lookback_days = st.sidebar.selectbox(
         "Lookback window",
@@ -72,27 +73,100 @@ def main(connector: DataConnector | None = None) -> None:
 
     date_from = date.today() - timedelta(days=lookback_days)
 
-    alert_config = AlertConfig(
-        warning_threshold=st.sidebar.slider(
-            "Warning threshold", min_value=0.05, max_value=0.50,
-            value=0.20, step=0.05, format="%.0f%%",
-        ),
-        critical_threshold=st.sidebar.slider(
-            "Critical threshold", min_value=0.10, max_value=0.75,
-            value=0.40, step=0.05, format="%.0f%%",
-        ),
-        min_transaction_count=st.sidebar.number_input(
-            "Min transactions (ignore below)", min_value=1, value=5,
-        ),
-    )
-
     result = run_pipeline(
         connector=connector,
         sql=build_query(date_from),
-        alert_config=alert_config,
+        alert_config=AlertConfig(
+            warning_threshold=0.20,
+            critical_threshold=0.40,
+            min_transaction_count=5,
+        ),
     )
 
-    summaries = result.summaries
+    # ── Merchant & risk scope ─────────────────────────────────────
+    st.sidebar.header("Scope")
+
+    all_merchants = sorted({s.merchant_id for s in result.summaries})
+    selected_merchants: list[str] = st.sidebar.multiselect(
+        "Merchants",
+        options=all_merchants,
+        default=[],
+        key="global_merchant_filter",
+        help="Leave empty to show all merchants",
+        placeholder="All merchants",
+    )
+    if not selected_merchants:
+        selected_merchants = all_merchants
+
+    risk_filter: list[str] = st.sidebar.multiselect(
+        "Risk rating",
+        options=["LOW", "MEDIUM", "HIGH"],
+        default=[],
+        key="risk_rating_filter",
+        help="Leave empty to show all ratings",
+        placeholder="All ratings",
+    )
+
+    all_reasons = sorted({
+        t.failure_reason
+        for t in result.raw_transactions
+        if t.failure_reason
+    })
+    reason_filter: list[str] = st.sidebar.multiselect(
+        "Failure reasons",
+        options=all_reasons,
+        default=[],
+        key="failure_reason_filter",
+        help="Narrows the Failure Analysis tab",
+        placeholder="All reasons",
+    )
+
+    # ── Alert thresholds ──────────────────────────────────────────
+    st.sidebar.header("Alert Thresholds")
+
+    alert_config = AlertConfig(
+        warning_threshold=st.sidebar.slider(
+            "Warning", min_value=0.05, max_value=0.50,
+            value=0.20, step=0.05, format="%d%%",
+            help="Merchants above this rate are flagged orange",
+        ),
+        critical_threshold=st.sidebar.slider(
+            "Critical", min_value=0.10, max_value=0.75,
+            value=0.40, step=0.05, format="%d%%",
+            help="Merchants above this rate are flagged red",
+        ),
+        min_transaction_count=st.sidebar.number_input(
+            "Minimum volume",
+            min_value=1,
+            value=5,
+            help="Ignore merchants with fewer transactions than this",
+        ),
+    )
+
+    # ── Apply filters ─────────────────────────────────────────────
+    merchant_set = set(selected_merchants)
+    summaries = [s for s in result.summaries if s.merchant_id in merchant_set]
+
+    raw_transactions = [
+        t for t in result.raw_transactions
+        if t.merchant_id in merchant_set
+    ]
+    if reason_filter:
+        raw_transactions = [
+            t for t in raw_transactions
+            if t.failure_reason in reason_filter or t.status.value != "FAILED"
+        ]
+
+    risk_profiles = [p for p in result.risk_profiles if p.merchant_id in merchant_set]
+    if risk_filter:
+        risk_profiles = [p for p in risk_profiles if p.risk_rating in risk_filter]
+
+    rolling_df = (
+        result.rolling_df[result.rolling_df["merchant_id"].isin(merchant_set)]
+        if not result.rolling_df.empty
+        else result.rolling_df
+    )
+
     alert = result.alert
 
     st.title("💳 Payments Platform Analytics")
@@ -110,7 +184,7 @@ def main(connector: DataConnector | None = None) -> None:
         else 0.0
     )
     high_risk_count = sum(
-        1 for p in result.risk_profiles if p.risk_rating == "HIGH"
+        1 for p in risk_profiles if p.risk_rating == "HIGH"
     )
 
     col1.metric("Active Merchants", total_merchants)
@@ -118,18 +192,18 @@ def main(connector: DataConnector | None = None) -> None:
     col3.metric("Avg Failure Rate", f"{avg_failure_rate:.1%}")
     col4.metric("High-Risk Merchants", high_risk_count)
 
-    tab_overview, tab_risk, tab_migration = st.tabs(
-        ["📈 Transaction Overview", "📊 Risk Analytics", "🔄 Migration Tracker"]
+    tab_overview, tab_risk, tab_failure = st.tabs(
+        ["📈 Transaction Overview", "📊 Risk Analytics", "🚨 Failure Analysis"]
     )
 
     with tab_overview:
-        render_charts(summaries)
+        render_charts(summaries, raw_transactions, alert_config)
 
     with tab_risk:
-        render_risk_dashboard(result.risk_profiles, result.rolling_df)
+        render_risk_dashboard(risk_profiles, rolling_df)
 
-    with tab_migration:
-        render_migration_tracker(summaries)
+    with tab_failure:
+        render_failure_analysis(raw_transactions)
 
     st.caption(
         f"Last refreshed: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"

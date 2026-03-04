@@ -16,6 +16,7 @@ from src.frontend.components.seaborn_charts import render_risk_heatmap, render_v
 from src.schemas.payments import MerchantRiskProfile
 
 _RISK_COLORS = {"LOW": "#21c354", "MEDIUM": "#ffa500", "HIGH": "#ff4b4b"}
+_MAX_CHART_MERCHANTS = 10
 
 
 def render_risk_dashboard(
@@ -25,49 +26,28 @@ def render_risk_dashboard(
     """Render the full risk analytics section.
 
     Args:
-        profiles: Per-merchant risk profiles from the pipeline.
+        profiles: Per-merchant risk profiles filtered by sidebar controls.
         rolling_df: Rolling success rate time-series for line charts.
     """
-    st.header("📊 Risk Analytics")
+    st.header("Risk Analytics")
 
     if not profiles:
-        st.info("Need at least 2 days of data per merchant for risk metrics.")
+        st.info("Need at least 3 days of data per merchant for risk metrics.")
         return
 
-    selected = _render_merchant_filter(profiles)
-
-    _render_risk_scorecards(selected)
-    render_risk_heatmap(selected)
+    _render_risk_scorecards(profiles)
+    render_risk_heatmap(profiles)
 
     col_l, col_r = st.columns(2)
     with col_l:
-        _render_sharpe_sortino_scatter(selected)
+        _render_sharpe_sortino_scatter(profiles)
     with col_r:
-        render_var_distribution(selected)
+        render_var_distribution(profiles)
 
     if not rolling_df.empty:
-        merchant_ids = [p.merchant_id for p in selected]
-        filtered_rolling = rolling_df[rolling_df["merchant_id"].isin(merchant_ids)]
-        if not filtered_rolling.empty:
-            _render_rolling_success_chart(filtered_rolling)
+        _render_rolling_statistics(rolling_df)
 
-    _render_risk_table(selected)
-
-
-def _render_merchant_filter(
-    profiles: list[MerchantRiskProfile],
-) -> list[MerchantRiskProfile]:
-    """Sidebar multiselect for merchant filtering."""
-    all_ids = [p.merchant_id for p in profiles]
-    chosen = st.multiselect(
-        "Filter merchants",
-        options=all_ids,
-        default=all_ids,
-        key="risk_merchant_filter",
-    )
-    if not chosen:
-        return profiles
-    return [p for p in profiles if p.merchant_id in chosen]
+    _render_risk_table(profiles)
 
 
 def _render_risk_scorecards(profiles: list[MerchantRiskProfile]) -> None:
@@ -120,30 +100,110 @@ def _render_sharpe_sortino_scatter(profiles: list[MerchantRiskProfile]) -> None:
     st.plotly_chart(fig, use_container_width=True)
 
 
-def _render_rolling_success_chart(rolling_df: pd.DataFrame) -> None:
-    """Plotly line chart: rolling 7-day success rate per merchant."""
+def _top_n_merchants(rolling_df: pd.DataFrame, n: int) -> pd.DataFrame:
+    """Limit to top N merchants by total volume to keep charts readable."""
+    if rolling_df["merchant_id"].nunique() <= n:
+        return rolling_df
+    vol = rolling_df.groupby("merchant_id")["success_rate"].count().nlargest(n)
+    return rolling_df[rolling_df["merchant_id"].isin(vol.index)]
+
+
+def _render_rolling_statistics(rolling_df: pd.DataFrame) -> None:
+    """Multi-panel rolling statistics."""
+    st.subheader("Rolling Statistics")
+
+    chart_df = _top_n_merchants(rolling_df, _MAX_CHART_MERCHANTS)
+
+    tab_mean, tab_vol, tab_dist = st.tabs(
+        ["Rolling Mean", "Rolling Volatility", "Daily Change Distribution"]
+    )
+
+    with tab_mean:
+        _render_rolling_mean_chart(chart_df)
+    with tab_vol:
+        _render_rolling_volatility_chart(chart_df)
+    with tab_dist:
+        _render_daily_change_histogram(rolling_df)
+
+
+def _render_rolling_mean_chart(rolling_df: pd.DataFrame) -> None:
+    """Line chart: rolling 7-day average success rate per merchant."""
     fig = px.line(
         rolling_df,
         x="txn_date",
-        y="rolling_success",
+        y="rolling_mean",
         color="merchant_id",
-        title="Rolling 7-Day Success Rate by Merchant",
+        title="Rolling 7-Day Avg Success Rate",
         labels={
             "txn_date": "Date",
-            "rolling_success": "Success Rate (7d avg)",
+            "rolling_mean": "Success Rate (7d avg)",
             "merchant_id": "Merchant",
         },
     )
     fig.add_hline(
         y=0.95, line_dash="dash", line_color="red",
-        annotation_text="95% SLA Target",
+        annotation_text="95% SLA",
     )
+    y_min = max(0, rolling_df["rolling_mean"].min() - 0.05)
     fig.update_layout(
         yaxis_tickformat=".0%",
+        yaxis_range=[y_min, 1.02],
         hovermode="x unified",
         margin=dict(l=0, r=0, t=40, b=0),
         height=400,
         legend=dict(orientation="h", yanchor="bottom", y=-0.3),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_rolling_volatility_chart(rolling_df: pd.DataFrame) -> None:
+    """Line chart: rolling 7-day std of success rate (volatility)."""
+    plot_df = rolling_df.dropna(subset=["rolling_std"])
+    if plot_df.empty:
+        st.info("Not enough data points for rolling volatility.")
+        return
+
+    fig = px.line(
+        plot_df,
+        x="txn_date",
+        y="rolling_std",
+        color="merchant_id",
+        title="Rolling 7-Day Volatility (Std Dev of Success Rate)",
+        labels={
+            "txn_date": "Date",
+            "rolling_std": "Volatility (σ)",
+            "merchant_id": "Merchant",
+        },
+    )
+    fig.update_layout(
+        yaxis_tickformat=".1%",
+        hovermode="x unified",
+        margin=dict(l=0, r=0, t=40, b=0),
+        height=400,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.3),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_daily_change_histogram(rolling_df: pd.DataFrame) -> None:
+    """Histogram of daily first-difference returns across all merchants."""
+    changes = rolling_df["daily_change"].dropna()
+    if changes.empty:
+        st.info("No daily change data available.")
+        return
+
+    fig = px.histogram(
+        changes,
+        nbins=min(50, max(10, len(changes) // 5)),
+        title="Distribution of Daily Success Rate Changes",
+        labels={"value": "Daily Change (pp)", "count": "Frequency"},
+        color_discrete_sequence=["#636EFA"],
+    )
+    fig.update_layout(
+        xaxis_tickformat=".0%",
+        showlegend=False,
+        margin=dict(l=0, r=0, t=40, b=0),
+        height=400,
     )
     st.plotly_chart(fig, use_container_width=True)
 
@@ -186,7 +246,7 @@ def _render_risk_table(profiles: list[MerchantRiskProfile]) -> None:
 
     csv = df.to_csv(index=False)
     st.download_button(
-        "📥 Download Risk Report (CSV)",
+        "Download Risk Report (CSV)",
         data=csv,
         file_name="merchant_risk_report.csv",
         mime="text/csv",

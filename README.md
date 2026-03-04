@@ -18,7 +18,7 @@ make run-pg          # http://localhost:8501
 |---------|-------------|
 | `make run-pg` | Dashboard against local PostgreSQL |
 | `make run` | Dashboard with mock data (no database) |
-| `make test` | 130 tests, 99% coverage |
+| `make test` | 142 tests, 99% coverage |
 | `make lint` | ruff |
 | `make typecheck` | mypy --strict |
 | `make all` | lint + typecheck + test |
@@ -51,18 +51,20 @@ DataConnector (Snowflake | PostgreSQL | Mock)
         → compute_daily_summary(df)        → list[TransactionSummary]
         → compute_risk_profiles(summaries) → list[MerchantRiskProfile]
         → check_success_rate_alert()       → AlertResult
-    → Tabs: Transaction Overview | Risk Analytics | Migration Tracker
+    → Tabs: Transaction Overview | Risk Analytics | Failure Analysis
+    → Sidebar: Lookback window, Merchant filter (global), Alert thresholds
 ```
 
 All connectors satisfy the `DataConnector` protocol (PEP 544).
+Sidebar merchant filter applies across all tabs and charts.
 
 ## Dashboard Tabs
 
 | Tab | Contents |
 |-----|----------|
-| **Transaction Overview** | Volume trend, failure rate by merchant, daily counts, top-10 merchants |
-| **Risk Analytics** | Sharpe/Sortino scatter, VaR distribution, risk heatmap, rolling success rates, downloadable risk report |
-| **Migration Tracker** | Merchant summary table with RAG-coloured failure rates |
+| **Transaction Overview** | Volume trend, failure rate by merchant (with threshold lines), failure reason breakdown, top-10 merchants |
+| **Risk Analytics** | Sharpe/Sortino scatter, VaR distribution, risk heatmap, rolling success rates (mean/volatility/change distribution), downloadable risk report |
+| **Failure Analysis** | Failure reason donut chart, failure by merchant (stacked bar), failure trend line, filterable transaction detail table with CSV download |
 
 ## Project Layout
 
@@ -87,14 +89,14 @@ src/
     app.py                          Streamlit composition root (tabbed layout)
     components/
       alert_banner.py               Severity-coloured banner
-      charts.py                     Plotly transaction charts (4 charts)
+      charts.py                     Plotly transaction charts (3 charts)
+      failure_analysis.py           Failure reason breakdown, trend, detail table
       risk_dashboard.py             Risk analytics: Plotly scatter, table, download
       seaborn_charts.py             Risk analytics: Seaborn heatmap, VaR histogram
-      migration_tracker.py          Merchant summary table with RAG colouring
 db/
   schema.sql                        PostgreSQL DDL with CHECK constraints
   seed.py                           Bootcamp CSV → PostgreSQL with validation
-tests/                              130 tests across 9 test files (99% coverage)
+tests/                              142 tests across 9 test files (99% coverage)
 ```
 
 ## Data Validation (seed.py)

@@ -1,16 +1,16 @@
 """Risk analytics engine — pure functions, no I/O.
 
-Maps traditional financial risk ratios to payments performance metrics:
-- Daily success rate (1 - failure_rate) is the "return"
-- Target SLA (e.g. 99%) is the "risk-free rate"
-- Downside deviation only considers days below SLA target
+Maps traditional financial risk ratios to payments performance metrics.
 
-Ratios computed per merchant:
-- Sharpe:  (mean_success - target) / std_success
-- Sortino: (mean_success - target) / downside_std
-- Calmar:  (mean_success - target) / max_drawdown
-- VaR95:   5th percentile of daily success rates
-- Max Drawdown: largest peak-to-trough drop in cumulative success
+Key mappings (adapted from bootcamp stock-analysis patterns):
+- Daily "return" = first-difference of success rate (bounded [0,1])
+- Annualization factor = 365 (payments operate every calendar day)
+- Sharpe = (mean_daily_return * 365) / (std_daily_return * sqrt(365))
+- Sortino = same but only downside std (days with negative returns)
+
+NOTE: ``pct_change()`` is intentionally NOT used because success rates
+can be 0.0 on low-volume days, producing inf/NaN.  First-difference
+(``np.diff``) is the correct analogue for bounded [0,1] metrics.
 """
 from __future__ import annotations
 
@@ -20,22 +20,24 @@ import pandas as pd
 from src.schemas.payments import MerchantRiskProfile, TransactionSummary
 
 DEFAULT_TARGET_SLA = 0.95
+ANNUALIZATION_FACTOR = 365
 
 
 def compute_risk_profiles(
     summaries: list[TransactionSummary],
     target_sla: float = DEFAULT_TARGET_SLA,
 ) -> list[MerchantRiskProfile]:
-    """Compute risk analytics for each merchant with >= 2 data points."""
+    """Compute risk analytics for each merchant with >= 3 data points."""
     if not summaries:
         return []
 
     df = pd.DataFrame([s.model_dump() for s in summaries])
     df["success_rate"] = 1.0 - df["failure_rate"]
+    df = df.sort_values(["merchant_id", "txn_date"])
 
     profiles: list[MerchantRiskProfile] = []
     for merchant_id, group in df.groupby("merchant_id"):
-        if len(group) < 2:
+        if len(group) < 3:
             continue
         profile = _compute_single_profile(str(merchant_id), group, target_sla)
         profiles.append(profile)
@@ -49,24 +51,39 @@ def _compute_single_profile(
     group: pd.DataFrame,
     target_sla: float,
 ) -> MerchantRiskProfile:
-    """All ratio math for one merchant."""
+    """All ratio math for one merchant using first-difference daily returns."""
     rates = group["success_rate"].to_numpy(dtype=np.float64)
     volumes = group["total_volume"].to_numpy(dtype=np.float64)
 
-    mean_rate = float(np.mean(rates))
-    std_rate = float(np.std(rates, ddof=1))
-    excess = mean_rate - target_sla
+    daily_returns = np.diff(rates)
 
-    sharpe = excess / std_rate if std_rate > 0 else None
+    mean_return = float(np.mean(daily_returns))
+    std_return = float(np.std(daily_returns, ddof=1))
 
-    downside = rates[rates < target_sla] - target_sla
-    downside_std = float(np.std(downside, ddof=1)) if len(downside) > 1 else 0.0
-    sortino = excess / downside_std if downside_std > 0 else None
+    ann = ANNUALIZATION_FACTOR
+    sharpe = (
+        (mean_return * ann) / (std_return * np.sqrt(ann))
+        if std_return > 0 else None
+    )
+
+    downside_returns = daily_returns[daily_returns < 0]
+    downside_std = (
+        float(np.std(downside_returns, ddof=1))
+        if len(downside_returns) > 1 else 0.0
+    )
+    sortino = (
+        (mean_return * ann) / (downside_std * np.sqrt(ann))
+        if downside_std > 0 else None
+    )
 
     mdd = _max_drawdown(rates)
-    calmar = excess / mdd if mdd > 0 else None
+    ann_excess = mean_return * ann
+    calmar = ann_excess / mdd if mdd > 0 else None
 
     var_95 = float(np.percentile(rates, 5))
+
+    mean_rate = float(np.mean(rates))
+    std_rate = float(np.std(rates, ddof=1))
 
     return MerchantRiskProfile(
         merchant_id=merchant_id,
@@ -85,11 +102,12 @@ def _compute_single_profile(
 
 
 def _max_drawdown(rates: np.ndarray) -> float:
-    """Largest peak-to-trough decline in cumulative success rates."""
-    cumulative = np.cumprod(rates / rates[0]) if rates[0] > 0 else rates
-    peak = np.maximum.accumulate(cumulative)
-    drawdowns = (peak - cumulative) / np.where(peak > 0, peak, 1.0)
-    return float(np.max(drawdowns)) if len(drawdowns) > 0 else 0.0
+    """Largest peak-to-trough decline in absolute success rate."""
+    if len(rates) < 2:
+        return 0.0
+    peak = np.maximum.accumulate(rates)
+    drawdowns = (peak - rates) / np.where(peak > 0, peak, 1.0)
+    return float(np.max(drawdowns))
 
 
 def _classify_risk(
@@ -112,10 +130,13 @@ def compute_rolling_success(
     summaries: list[TransactionSummary],
     window: int = 7,
 ) -> pd.DataFrame:
-    """Rolling average success rate per merchant for time-series charts.
+    """Rolling statistics per merchant for time-series charts.
 
-    Returns a DataFrame with columns:
-    merchant_id, txn_date, success_rate, rolling_success, rolling_volume
+    Uses first-difference (not pct_change) for daily returns because
+    success rates are bounded [0,1] and can be 0.0 on low-volume days.
+
+    Returns columns: merchant_id, txn_date, success_rate, daily_change,
+    rolling_mean, rolling_std
     """
     if not summaries:
         return pd.DataFrame()
@@ -128,11 +149,17 @@ def compute_rolling_success(
     parts: list[pd.DataFrame] = []
     for _, group in df.groupby("merchant_id", sort=False):
         g = group.copy()
-        g["rolling_success"] = g["success_rate"].rolling(window, min_periods=1).mean()
-        g["rolling_volume"] = g["total_volume"].rolling(window, min_periods=1).mean()
+        g["daily_change"] = g["success_rate"].diff()
+        g["rolling_mean"] = g["success_rate"].rolling(window, min_periods=1).mean()
+        g["rolling_std"] = g["success_rate"].rolling(
+            window, min_periods=min(2, window),
+        ).std()
         parts.append(g)
 
     rolling = pd.concat(parts, ignore_index=True) if parts else df
     return rolling[
-        ["merchant_id", "txn_date", "success_rate", "rolling_success", "rolling_volume"]
+        [
+            "merchant_id", "txn_date", "success_rate", "daily_change",
+            "rolling_mean", "rolling_std",
+        ]
     ].reset_index(drop=True)

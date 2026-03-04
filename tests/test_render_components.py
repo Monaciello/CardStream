@@ -7,12 +7,13 @@ various inputs, not pixel-level correctness (that's visual QA).
 from __future__ import annotations
 
 from datetime import date, timedelta
-from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pandas as pd
 import pytest
 
-from src.schemas.payments import MerchantRiskProfile, TransactionSummary
+from src.backend.transforms.alert_models import AlertConfig
+from src.schemas.payments import MerchantRiskProfile, RawTransaction, TransactionSummary, TransactionStatus
 
 
 def _make_summaries(
@@ -56,18 +57,41 @@ def _make_profiles(count: int = 3) -> list[MerchantRiskProfile]:
 
 
 def _make_rolling_df(merchants: int = 3, days: int = 10) -> pd.DataFrame:
-    """Generate a rolling success DataFrame."""
+    """Generate a rolling statistics DataFrame."""
+    rng = np.random.default_rng(99)
     rows = []
     for m in range(merchants):
+        base_rate = 0.95 - m * 0.03
         for d in range(days):
+            rate = base_rate + rng.normal(0, 0.01)
             rows.append({
                 "merchant_id": f"MERCH-{chr(65 + m)}",
                 "txn_date": pd.Timestamp(date(2025, 1, 1) + timedelta(days=d)),
-                "success_rate": 0.95 - m * 0.03,
-                "rolling_success": 0.94 - m * 0.03,
-                "rolling_volume": 1000.0 + m * 100,
+                "success_rate": rate,
+                "daily_change": rng.normal(0, 0.01) if d > 0 else float("nan"),
+                "rolling_mean": rate - 0.005,
+                "rolling_std": abs(rng.normal(0.01, 0.003)),
             })
     return pd.DataFrame(rows)
+
+
+def _make_raw_transactions(merchants: int = 3, per_merchant: int = 10) -> list[RawTransaction]:
+    """Generate raw transactions with some failures for testing."""
+    result = []
+    txn_id = 1
+    for m in range(merchants):
+        for i in range(per_merchant):
+            is_failed = i % 4 == 0
+            result.append(RawTransaction(
+                transaction_id=f"TXN-{txn_id:05d}",
+                merchant_id=f"MERCH-{chr(65 + m)}",
+                amount=100.0 + i * 10,
+                status=TransactionStatus.FAILED if is_failed else TransactionStatus.SUCCESS,
+                failure_reason="TIMEOUT" if is_failed else None,
+                txn_date=date(2025, 1, 10) + timedelta(days=i % 7),
+            ))
+            txn_id += 1
+    return result
 
 
 # ── charts.py ──────────────────────────────────────────────────────
@@ -77,15 +101,18 @@ class TestRenderCharts:
 
     def test_render_charts_with_data(self) -> None:
         from src.frontend.components.charts import render_charts
-        render_charts(_make_summaries())
+        alert_config = AlertConfig(warning_threshold=0.20, critical_threshold=0.40, min_transaction_count=5)
+        render_charts(_make_summaries(), _make_raw_transactions(), alert_config)
 
     def test_render_charts_empty_shows_info(self) -> None:
         from src.frontend.components.charts import render_charts
-        render_charts([])
+        alert_config = AlertConfig(warning_threshold=0.20, critical_threshold=0.40, min_transaction_count=5)
+        render_charts([], [], alert_config)
 
     def test_render_charts_single_merchant(self) -> None:
         from src.frontend.components.charts import render_charts
-        render_charts(_make_summaries(merchants=1, days=5))
+        alert_config = AlertConfig(warning_threshold=0.20, critical_threshold=0.40, min_transaction_count=5)
+        render_charts(_make_summaries(merchants=1, days=5), _make_raw_transactions(merchants=1), alert_config)
 
     def test_volume_trend_runs(self) -> None:
         from src.frontend.components.charts import _render_volume_trend
@@ -95,15 +122,14 @@ class TestRenderCharts:
 
     def test_failure_rate_by_merchant_runs(self) -> None:
         from src.frontend.components.charts import _render_failure_rate_by_merchant
+        alert_config = AlertConfig(warning_threshold=0.20, critical_threshold=0.40, min_transaction_count=5)
         df = pd.DataFrame([s.model_dump() for s in _make_summaries()])
         df["txn_date"] = pd.to_datetime(df["txn_date"])
-        _render_failure_rate_by_merchant(df)
+        _render_failure_rate_by_merchant(df, alert_config)
 
-    def test_daily_txn_counts_runs(self) -> None:
-        from src.frontend.components.charts import _render_daily_txn_counts
-        df = pd.DataFrame([s.model_dump() for s in _make_summaries()])
-        df["txn_date"] = pd.to_datetime(df["txn_date"])
-        _render_daily_txn_counts(df)
+    def test_failure_reason_breakdown_runs(self) -> None:
+        from src.frontend.components.charts import _render_failure_reason_breakdown
+        _render_failure_reason_breakdown(_make_raw_transactions())
 
     def test_top_merchants_bar_runs(self) -> None:
         from src.frontend.components.charts import _render_top_merchants_bar
@@ -145,9 +171,46 @@ class TestRiskDashboardComponents:
         from src.frontend.components.risk_dashboard import _render_sharpe_sortino_scatter
         _render_sharpe_sortino_scatter(_make_profiles())
 
-    def test_rolling_success_chart(self) -> None:
-        from src.frontend.components.risk_dashboard import _render_rolling_success_chart
-        _render_rolling_success_chart(_make_rolling_df())
+    def test_rolling_statistics(self) -> None:
+        from src.frontend.components.risk_dashboard import _render_rolling_statistics
+        _render_rolling_statistics(_make_rolling_df())
+
+    def test_rolling_mean_chart(self) -> None:
+        from src.frontend.components.risk_dashboard import _render_rolling_mean_chart
+        _render_rolling_mean_chart(_make_rolling_df())
+
+    def test_rolling_volatility_chart(self) -> None:
+        from src.frontend.components.risk_dashboard import _render_rolling_volatility_chart
+        _render_rolling_volatility_chart(_make_rolling_df())
+
+    def test_rolling_volatility_empty(self) -> None:
+        from src.frontend.components.risk_dashboard import _render_rolling_volatility_chart
+        empty_df = pd.DataFrame(columns=[
+            "merchant_id", "txn_date", "success_rate", "daily_change",
+            "rolling_mean", "rolling_std",
+        ])
+        _render_rolling_volatility_chart(empty_df)
+
+    def test_daily_change_histogram(self) -> None:
+        from src.frontend.components.risk_dashboard import _render_daily_change_histogram
+        _render_daily_change_histogram(_make_rolling_df())
+
+    def test_daily_change_empty(self) -> None:
+        from src.frontend.components.risk_dashboard import _render_daily_change_histogram
+        empty_df = pd.DataFrame({"daily_change": pd.Series([], dtype=float)})
+        _render_daily_change_histogram(empty_df)
+
+    def test_top_n_merchants_limits(self) -> None:
+        from src.frontend.components.risk_dashboard import _top_n_merchants
+        big_df = _make_rolling_df(merchants=15, days=5)
+        trimmed = _top_n_merchants(big_df, 5)
+        assert trimmed["merchant_id"].nunique() == 5
+
+    def test_top_n_merchants_passthrough_small(self) -> None:
+        from src.frontend.components.risk_dashboard import _top_n_merchants
+        small_df = _make_rolling_df(merchants=3, days=5)
+        result = _top_n_merchants(small_df, 10)
+        assert len(result) == len(small_df)
 
     def test_risk_table(self) -> None:
         from src.frontend.components.risk_dashboard import _render_risk_table
@@ -160,21 +223,6 @@ class TestRiskDashboardComponents:
     def test_safe_mean_empty(self) -> None:
         from src.frontend.components.risk_dashboard import _safe_mean
         assert _safe_mean([]) == 0.0
-
-    def test_merchant_filter_returns_all_by_default(self) -> None:
-        from src.frontend.components.risk_dashboard import _render_merchant_filter
-        profiles = _make_profiles()
-        result = _render_merchant_filter(profiles)
-        assert len(result) == len(profiles)
-
-    @patch("src.frontend.components.risk_dashboard.st")
-    def test_merchant_filter_empty_selection_returns_all(self, mock_st: MagicMock) -> None:
-        """When multiselect returns [] (user cleared all), fall back to full list."""
-        from src.frontend.components.risk_dashboard import _render_merchant_filter
-        mock_st.multiselect.return_value = []
-        profiles = _make_profiles()
-        result = _render_merchant_filter(profiles)
-        assert result == profiles
 
 
 # ── seaborn_charts.py ──────────────────────────────────────────────
@@ -232,17 +280,32 @@ class TestSeabornCharts:
         _render_figure(fig)
 
 
-# ── migration_tracker.py ───────────────────────────────────────────
+# ── failure_analysis.py ───────────────────────────────────────────
 
-class TestMigrationTracker:
+class TestFailureAnalysis:
 
-    def test_render_with_data(self) -> None:
-        from src.frontend.components.migration_tracker import render_migration_tracker
-        render_migration_tracker(_make_summaries(merchants=2, days=3))
+    def test_render_with_failed_transactions(self) -> None:
+        from src.frontend.components.failure_analysis import render_failure_analysis
+        render_failure_analysis(_make_raw_transactions(merchants=3, per_merchant=10))
 
     def test_render_empty_shows_info(self) -> None:
-        from src.frontend.components.migration_tracker import render_migration_tracker
-        render_migration_tracker([])
+        from src.frontend.components.failure_analysis import render_failure_analysis
+        render_failure_analysis([])
+
+    def test_render_no_failures_shows_success(self) -> None:
+        from src.frontend.components.failure_analysis import render_failure_analysis
+        all_success = [
+            RawTransaction(
+                transaction_id=f"TXN-{i:05d}",
+                merchant_id="MERCH-A",
+                amount=100.0,
+                status=TransactionStatus.SUCCESS,
+                failure_reason=None,
+                txn_date=date(2025, 1, 10),
+            )
+            for i in range(5)
+        ]
+        render_failure_analysis(all_success)
 
 
 # ── alert_models edge case ─────────────────────────────────────────

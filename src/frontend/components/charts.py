@@ -6,15 +6,21 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from src.schemas.payments import TransactionSummary
+from src.backend.transforms.alert_models import AlertConfig
+from src.schemas.payments import RawTransaction, TransactionSummary
 
 
-def render_charts(summaries: list[TransactionSummary]) -> None:
+def render_charts(
+    summaries: list[TransactionSummary],
+    raw_transactions: list[RawTransaction],
+    alert_config: AlertConfig,
+) -> None:
     """Render all dashboard charts from pipeline summaries.
 
     Args:
-        summaries: Output of ``compute_daily_summary``. Empty list
-            renders a friendly empty-state message.
+        summaries: Output of ``compute_daily_summary``.
+        raw_transactions: Raw transaction data for failure analysis.
+        alert_config: Threshold configuration for drawing reference lines.
     """
     if not summaries:
         st.info("No data available for charts.")
@@ -27,9 +33,9 @@ def render_charts(summaries: list[TransactionSummary]) -> None:
 
     col_left, col_right = st.columns(2)
     with col_left:
-        _render_failure_rate_by_merchant(df)
+        _render_failure_rate_by_merchant(df, alert_config)
     with col_right:
-        _render_daily_txn_counts(df)
+        _render_failure_reason_breakdown(raw_transactions)
 
     _render_top_merchants_bar(df)
 
@@ -58,8 +64,11 @@ def _render_volume_trend(df: pd.DataFrame) -> None:
     st.plotly_chart(fig, use_container_width=True)
 
 
-def _render_failure_rate_by_merchant(df: pd.DataFrame) -> None:
-    """Horizontal bar chart — average failure rate per merchant."""
+def _render_failure_rate_by_merchant(
+    df: pd.DataFrame,
+    alert_config: AlertConfig,
+) -> None:
+    """Horizontal bar chart — average failure rate per merchant with thresholds."""
     merchant_avg = (
         df.groupby("merchant_id", as_index=False)
         .agg(
@@ -70,7 +79,9 @@ def _render_failure_rate_by_merchant(df: pd.DataFrame) -> None:
     )
 
     colors = [
-        "#ff4b4b" if r >= 0.40 else "#ffa500" if r >= 0.20 else "#21c354"
+        "#ff4b4b" if r >= alert_config.critical_threshold
+        else "#ffa500" if r >= alert_config.warning_threshold
+        else "#21c354"
         for r in merchant_avg["avg_failure_rate"]
     ]
 
@@ -84,6 +95,22 @@ def _render_failure_rate_by_merchant(df: pd.DataFrame) -> None:
             textposition="auto",
         )
     )
+    
+    fig.add_vline(
+        x=alert_config.warning_threshold,
+        line_dash="dash",
+        line_color="#ffa500",
+        annotation_text=f"Warning ({alert_config.warning_threshold:.0%})",
+        annotation_position="top right",
+    )
+    fig.add_vline(
+        x=alert_config.critical_threshold,
+        line_dash="dash",
+        line_color="#ff4b4b",
+        annotation_text=f"Critical ({alert_config.critical_threshold:.0%})",
+        annotation_position="top right",
+    )
+    
     fig.update_layout(
         title="Failure Rate by Merchant",
         xaxis_title="Avg Failure Rate",
@@ -94,21 +121,44 @@ def _render_failure_rate_by_merchant(df: pd.DataFrame) -> None:
     st.plotly_chart(fig, use_container_width=True)
 
 
-def _render_daily_txn_counts(df: pd.DataFrame) -> None:
-    """Bar chart — daily transaction count."""
-    daily = (
-        df.groupby("txn_date", as_index=False)
-        .agg(txn_count=("txn_count", "sum"))
+def _render_failure_reason_breakdown(raw_transactions: list[RawTransaction]) -> None:
+    """Stacked bar chart — failure reason distribution by merchant."""
+    if not raw_transactions:
+        st.info("No transaction data available.")
+        return
+
+    failed = [t for t in raw_transactions if t.status.value == "FAILED"]
+    
+    if not failed:
+        st.info("No failed transactions in selected window.")
+        return
+
+    df = pd.DataFrame([
+        {
+            "merchant_id": t.merchant_id,
+            "failure_reason": t.failure_reason or "UNKNOWN",
+        }
+        for t in failed
+    ])
+
+    counts = (
+        df.groupby(["failure_reason"], as_index=False)
+        .size()
+        .rename(columns={"size": "count"})
+        .sort_values("count", ascending=False)
     )
+
     fig = px.bar(
-        daily,
-        x="txn_date",
-        y="txn_count",
-        title="Daily Transaction Count",
-        labels={"txn_date": "Date", "txn_count": "Transactions"},
-        color_discrete_sequence=["#AB63FA"],
+        counts,
+        x="failure_reason",
+        y="count",
+        title="Failure Reason Breakdown",
+        labels={"failure_reason": "Reason", "count": "Count"},
+        color="failure_reason",
+        color_discrete_sequence=px.colors.qualitative.Set2,
     )
     fig.update_layout(
+        showlegend=False,
         margin=dict(l=0, r=0, t=40, b=0),
         height=400,
     )
@@ -148,12 +198,18 @@ def _render_top_merchants_bar(df: pd.DataFrame) -> None:
     ))
     fig.update_layout(
         barmode="stack",
-        title="Top 10 Merchants by Volume (Success vs Failed)",
+        title="Top 10 Merchants by Volume",
         xaxis_title="Volume ($)",
         xaxis_tickprefix="$",
         xaxis_tickformat=",.0f",
-        margin=dict(l=0, r=0, t=40, b=0),
-        height=400,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        margin=dict(l=0, r=0, t=60, b=0),
+        height=420,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+        ),
     )
     st.plotly_chart(fig, use_container_width=True)
