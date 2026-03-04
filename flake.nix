@@ -54,6 +54,7 @@
               # Decrypt secrets if available; fall back to defaults for first-time setup
               if [ -f secrets.yaml ]; then
                 eval "$(sops --decrypt --output-type dotenv secrets.yaml 2>/dev/null \
+                  | sed 's/=\(.*\)/="\1"/' \
                   | sed 's/^/export /')" \
                   && echo "🔐 Secrets loaded from secrets.yaml"
               else
